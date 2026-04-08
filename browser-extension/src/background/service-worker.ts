@@ -181,18 +181,30 @@ async function getCredentialsForUrl(url: string): Promise<any[]> {
 }
 
 // ---- Message Handling ----
+// Messages that represent an explicit user gesture and should reset the
+// auto-lock timer. Passive lookups (e.g. GET_CREDENTIALS_FOR_URL fired by
+// the content-script's mutation observer on every page load) MUST NOT
+// reset the timer, otherwise the vault never auto-locks.
+const USER_GESTURE_MESSAGES = new Set([
+  'GET_AUTH_STATUS',
+  'GET_VAULT_ITEMS',
+  'SET_VAULT_KEY',
+  'COPY_SECURE',
+  'NKVAULT_AUTOFILL',
+  'SAVE_CREDENTIAL',
+  'UPDATE_CREDENTIAL',
+]);
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const handle = async () => {
-    resetAutoLock();
+    if (USER_GESTURE_MESSAGES.has(message?.type)) {
+      resetAutoLock();
+    }
 
     switch (message.type) {
       case 'GET_AUTH_STATUS': {
-        // Check chrome.storage for auth
-        const stored = await chrome.storage.local.get(['nkvault_auth']);
-        const hasStoredAuth = !!stored.nkvault_auth;
-
         return {
-          authenticated: !!authUser || hasStoredAuth,
+          authenticated: !!authUser,
           user: authUser,
           vaultUnlocked: !!vaultKey,
           hasProfile: !!authUser,
@@ -241,19 +253,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'SAVE_AUTH': {
-        await chrome.storage.local.set({
-          nkvault_auth: {
-            token: message.token,
-            refreshToken: message.refreshToken,
-            user: message.user,
-            savedAt: Date.now(),
-          }
-        });
-        authUser = message.user;
-
-        // Re-init DB connection
-        if (!db) await initDB();
-        return { success: true };
+        // SECURITY: Removed in security/hardening-pass-1. The previous
+        // bridge accepted a literal "session-active" string from any
+        // page on a "trusted" origin and set authUser from it — there
+        // was no cryptographic verification, so any local app on a
+        // permitted origin could impersonate any user. Auth state is
+        // now tracked exclusively via db.subscribeAuth on this worker.
+        return { success: false, error: 'SAVE_AUTH disabled' };
       }
 
       case 'COPY_SECURE': {
@@ -273,11 +279,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case 'AUTH_SYNC_CHECK': {
-        const data = await chrome.storage.local.get(['nkvault_auth']);
-        if (data.nkvault_auth) {
-          authUser = data.nkvault_auth.user;
-          if (!db) await initDB();
-        }
+        // Trust only db.subscribeAuth — do not seed authUser from storage.
+        if (!db) await initDB();
         return { authenticated: !!authUser };
       }
 
@@ -442,15 +445,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ---- Startup ----
+// Drop any stale nkvault_auth blob — we no longer trust persisted auth.
+chrome.storage.local.remove('nkvault_auth').catch(() => {});
 initDB();
-chrome.storage.local.get(['nkvault_auth', 'nkvault_never_save'], (data) => {
-  if (data.nkvault_auth?.user) {
-    authUser = data.nkvault_auth.user;
-    console.log('[NKVault BG] Restored auth:', authUser.email);
-  }
+chrome.storage.local.get(['nkvault_never_save'], (data) => {
   if (data.nkvault_never_save) {
     neverSaveDomains = new Set(data.nkvault_never_save);
-    console.log('[NKVault BG] Restored never-save domains:', neverSaveDomains.size);
   }
 });
 

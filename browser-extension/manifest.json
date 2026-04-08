@@ -33,7 +33,6 @@
     "128": "icons/icon-128.png"
   },
   "host_permissions": [
-    "http://localhost:5173/*",
     "https://*.nkvault.app/*"
   ]
 }

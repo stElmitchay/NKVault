@@ -137,34 +137,80 @@ function buildSignMessage(email: string): Uint8Array {
   return new TextEncoder().encode(message);
 }
 
+/** Generate a fresh random salt for wallet key derivation. Base64-encoded. */
+export function generateKdfSalt(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function b64decode(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 /**
- * Sign the vault message with the connected wallet and derive an AES-256-GCM key.
+ * Derive an AES-256-GCM wrap key from a Solana wallet signature using HKDF
+ * with a per-profile random salt and a domain-separation context label.
  *
  * Flow:
  * 1. Wallet signs a deterministic message → 64-byte Ed25519 signature
- * 2. SHA-256(signature) → 32-byte key material
- * 3. Import as AES-256-GCM CryptoKey with wrapKey/unwrapKey usages
+ * 2. Import the signature as HKDF input key material
+ * 3. HKDF-SHA256(salt = profile.kdfSalt, info = "NKVault v2 wrapKey:<userId>")
+ *    → AES-256-GCM CryptoKey with wrapKey/unwrapKey usages
  *
- * This key is used to wrap/unwrap the random vault encryption key,
- * exactly like the old Argon2id-derived key but without any password.
+ * If `salt` is omitted (legacy profile), falls back to the v1 SHA-256(sig)
+ * derivation so existing vaults can still be unlocked. Callers should
+ * generate a fresh salt and re-wrap the vault key the next time the user
+ * sets up — see crypto.svelte.ts.
  */
 export async function deriveKeyFromWallet(
   provider: SolanaProvider,
-  email: string
+  email: string,
+  opts?: { salt?: string; userId?: string }
 ): Promise<CryptoKey> {
   const messageBytes = buildSignMessage(email);
 
   // 1. Sign — deterministic for Ed25519
   const { signature } = await provider.signMessage(messageBytes);
 
-  // 2. SHA-256 the 64-byte signature → 32 bytes of key material
-  const keyMaterial = await crypto.subtle.digest('SHA-256', signature.buffer as ArrayBuffer);
+  // ---- Legacy v1 path: no salt yet ----
+  if (!opts?.salt) {
+    const keyMaterial = await crypto.subtle.digest('SHA-256', signature.buffer as ArrayBuffer);
+    return crypto.subtle.importKey(
+      'raw',
+      keyMaterial,
+      { name: 'AES-GCM' },
+      false,
+      ['wrapKey', 'unwrapKey']
+    );
+  }
 
-  // 3. Import as AES-GCM key (matches keys.ts wrapping format)
-  return crypto.subtle.importKey(
+  // ---- v2 path: HKDF with per-profile salt ----
+  const ikm = await crypto.subtle.importKey(
     'raw',
-    keyMaterial,
-    { name: 'AES-GCM' },
+    signature.buffer as ArrayBuffer,
+    'HKDF',
+    false,
+    ['deriveKey']
+  );
+
+  const saltBytes = b64decode(opts.salt);
+  const info = new TextEncoder().encode(`NKVault v2 wrapKey:${opts.userId ?? ''}`);
+
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: saltBytes,
+      info,
+    },
+    ikm,
+    { name: 'AES-GCM', length: 256 },
     false,
     ['wrapKey', 'unwrapKey']
   );

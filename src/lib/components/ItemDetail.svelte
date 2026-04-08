@@ -2,7 +2,10 @@
   import { ITEM_TYPE_META, type ItemType } from '$lib/types';
   import { maskValue, formatDate, getFaviconUrl } from '$lib/utils/helpers';
   import { secureCopy } from '$lib/crypto/clipboard';
+  import { getSettings } from '$lib/stores/settings.svelte';
   import Icon from './Icon.svelte';
+
+  const settings = getSettings();
 
   interface Props {
     item: any;
@@ -28,7 +31,7 @@
   }
 
   async function handleCopy(value: string, field: string) {
-    const ok = await secureCopy(value);
+    const ok = await secureCopy(value, settings.clipboardClearSeconds * 1000);
     if (ok) {
       copiedField = field;
       clipboardTimer = field;

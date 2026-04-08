@@ -7,36 +7,20 @@
   const BADGE_CLASS = 'nkvault-autofill-badge';
   const DROPDOWN_CLASS = 'nkvault-dropdown';
   const SAVE_BANNER_CLASS = 'nkvault-save-banner';
-  const NKVAULT_ORIGINS = ['http://localhost:5173', 'https://nkvault.app', 'https://www.nkvault.app'];
+  const NKVAULT_ORIGINS = ['https://nkvault.app', 'https://www.nkvault.app'];
 
   // Track forms we've already offered to save for (avoid duplicate prompts)
   const savedForms = new Set<string>();
 
-  // ---- Auth Sync ----
-  // Listen for auth messages from NKVault web app
+  // ---- Lock-state Bridge ----
+  // The web app NEVER posts the vault key or auth credentials cross-context.
+  // The extension derives its own vault key via the wallet path. We only
+  // accept lock signals here and only from the production NKVault origins.
   window.addEventListener('message', (event) => {
     if (!NKVAULT_ORIGINS.includes(event.origin)) return;
-
-    if (event.data?.type === 'NKVAULT_AUTH_SYNC') {
-      chrome.runtime.sendMessage({
-        type: 'SAVE_AUTH',
-        token: event.data.token,
-        refreshToken: event.data.refreshToken,
-        user: event.data.user,
-      });
-    }
-
-    if (event.data?.type === 'NKVAULT_VAULT_KEY_SYNC') {
-      chrome.runtime.sendMessage({
-        type: 'SET_VAULT_KEY',
-        keyBase64: event.data.keyBase64,
-      });
-    }
-
+    if (event.source !== window) return;
     if (event.data?.type === 'NKVAULT_VAULT_LOCKED') {
-      chrome.runtime.sendMessage({
-        type: 'LOCK_VAULT',
-      });
+      chrome.runtime.sendMessage({ type: 'LOCK_VAULT' });
     }
   });
 
@@ -109,11 +93,13 @@
         // Attach autosave listener to the form
         attachAutosaveListener(form, el, usernameField);
 
-        // Check if this is a signup form and auto-fill it
-        if (isSignupForm(form) && !autoFilledForms.has(form)) {
-          autoFilledForms.add(form);
-          autoFillSignupForm(form);
-        }
+        // SECURITY: Auto-fill of signup forms without an explicit user
+        // gesture has been removed. A drive-by signup heuristic on
+        // <all_urls> would auto-paste the user's identity + a generated
+        // password into any page that matched, which a malicious page
+        // could then exfiltrate. The user must now click the badge to
+        // fill credentials. (security/hardening-pass-1)
+        void isSignupForm; void autoFilledForms; void form;
       }
 
       attachBadge(el, usernameField);
@@ -456,7 +442,7 @@
       color: #f0f0f0;
     `;
 
-    const favicon = `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
+    const favicon = safeFaviconUrl(domain);
     const isUpdate = mode === 'update';
     const displayUsername = username ? escapeHtml(username) : '<span style="color:#666;">No username</span>';
 
@@ -483,7 +469,7 @@
       </div>
 
       <div style="display: flex; align-items: center; gap: 10px; padding: 10px; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); margin-bottom: 14px;">
-        <img src="${favicon}" alt="" style="width: 20px; height: 20px; border-radius: 4px; background: #333;" onerror="this.style.display='none'"/>
+        ${favicon ? `<img src="${escapeHtml(favicon)}" alt="" style="width: 20px; height: 20px; border-radius: 4px; background: #333;" onerror="this.style.display='none'"/>` : ''}
         <div style="flex: 1; min-width: 0;">
           <div style="font-size: 12px; font-weight: 500; color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${displayUsername}</div>
           <div style="font-size: 11px; color: #555; font-family: 'SF Mono', monospace; letter-spacing: 2px;">••••••••</div>
@@ -733,10 +719,10 @@
             transition: background 0.1s;
           `;
 
-          const favicon = `https://www.google.com/s2/favicons?domain=${normalizeUrlSimple(cred.url)}&sz=32`;
+          const favicon = safeFaviconUrl(cred.url);
 
           row.innerHTML = `
-            <img src="${favicon}" alt="" style="width: 24px; height: 24px; border-radius: 4px; background: #333;" onerror="this.style.display='none'"/>
+            ${favicon ? `<img src="${escapeHtml(favicon)}" alt="" style="width: 24px; height: 24px; border-radius: 4px; background: #333;" onerror="this.style.display='none'"/>` : ''}
             <div style="flex: 1; min-width: 0;">
               <div style="font-size: 13px; font-weight: 500; color: #f0f0f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(cred.title)}</div>
               <div style="font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(cred.username)}</div>
@@ -815,9 +801,33 @@
   }
 
   function escapeHtml(text: string): string {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    // Element-context escaping was incomplete: a textContent-based escaper
+    // does not encode `"` or `'`, so any value used inside a quoted HTML
+    // attribute could break out. Escape all five entities explicitly.
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /**
+   * Build a safe favicon URL. Only emits a result for http(s) URLs whose
+   * hostname parses cleanly; otherwise returns an empty string so the
+   * caller can omit the <img> rather than interpolate attacker-controlled
+   * data into an HTML attribute.
+   */
+  function safeFaviconUrl(rawUrl: string): string {
+    try {
+      const u = new URL(rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+      const host = u.hostname;
+      if (!/^[a-z0-9.\-]+$/i.test(host)) return '';
+      return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`;
+    } catch {
+      return '';
+    }
   }
 
   function injectStyles() {
