@@ -22,6 +22,10 @@ const schema = i.schema({
       email: i.string(),
       walletAddress: i.string(),
       encryptedVaultKey: i.string(),
+      // Per-profile random salt (base64) for HKDF wallet key derivation.
+      // Optional for backwards-compat with profiles created before
+      // security/hardening-pass-1.
+      kdfSalt: i.string().optional(),
       hasCompletedSetup: i.boolean(),
       createdAt: i.number(),
     }),

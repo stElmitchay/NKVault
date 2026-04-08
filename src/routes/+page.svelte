@@ -35,14 +35,15 @@
     auth.user ? vault.getFilteredItems(auth.user.id) : []
   );
 
-  // Decrypted items for display (titles + data decrypted)
+  // List view holds only non-secret display fields. Full plaintext for
+  // a single selected item lives in `decryptedData` (below) and is
+  // cleared on navigation. See docs/THREAT_MODEL.md §6.
   let displayItems = $state<any[]>([]);
 
-  // Decrypt items whenever the raw filtered list changes
   $effect(() => {
     const raw = filteredItems;
     const q = vault.searchQuery?.trim().toLowerCase() || '';
-    vault.decryptItems(raw).then((decrypted) => {
+    vault.decryptItemsForList(raw).then((decrypted) => {
       if (q) {
         displayItems = decrypted.filter((item: any) =>
           item.title.toLowerCase().includes(q)
@@ -99,8 +100,17 @@
     showSettings = false;
     mobileShowDetail = true;
 
-    // displayItems are already decrypted — use data directly
-    decryptedData = item.data;
+    // Clear any previous full-decrypt before fetching the new one so
+    // a slow decrypt cannot leave stale plaintext from a different
+    // item visible. Then decrypt the full data for THIS item only.
+    decryptedData = null;
+    const requestedId = item.id;
+    const full = await vault.decryptItemFull(requestedId);
+    // Guard against the user selecting a different item before this
+    // promise resolved.
+    if (selectedItem?.id === requestedId && full) {
+      decryptedData = full.data;
+    }
   }
 
   async function handleToggleFavorite(itemId: string, current: boolean) {
@@ -122,8 +132,18 @@
 
   async function handleEditItem() {
     if (!selectedItem) return;
-    // displayItems are already decrypted — data is ready for editing
-    editingItem = { ...selectedItem, data: decryptedData || selectedItem.data };
+    // The list-safe `selectedItem` has no secret fields. We need the
+    // full plaintext, which `handleSelectItem` already populated into
+    // `decryptedData`. If the user clicked Edit before that resolved,
+    // pull a fresh decryption now.
+    let data = decryptedData;
+    if (!data) {
+      const full = await vault.decryptItemFull(selectedItem.id);
+      if (!full) return;
+      data = full.data;
+      decryptedData = data;
+    }
+    editingItem = { ...selectedItem, data };
     showForm = true;
     mobileShowDetail = true;
   }

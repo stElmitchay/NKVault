@@ -28,7 +28,7 @@ export async function importKey(
 ): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     'raw',
-    raw,
+    raw as BufferSource,
     { name: 'AES-GCM' },
     extractable,
     usages
@@ -65,9 +65,9 @@ export async function unwrapKey(wrapped: WrappedKey, wrappingKey: CryptoKey): Pr
 
   return crypto.subtle.unwrapKey(
     'raw',
-    data,
+    data as BufferSource,
     wrappingKey,
-    { name: 'AES-GCM', iv },
+    { name: 'AES-GCM', iv: iv as BufferSource },
     { name: 'AES-GCM', length: 256 },
     true, // extractable — so it can be re-wrapped on password change
     ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']

@@ -1,7 +1,14 @@
 <script lang="ts">
   import { ITEM_TYPE_META } from '$lib/types';
-  import { getItemSubtitle, getFaviconUrl } from '$lib/utils/helpers';
   import Icon from './Icon.svelte';
+
+  // List items are list-safe projections produced by
+  // `vault.decryptItemsForList`: they expose `_subtitle` and
+  // `_faviconHost` instead of secret-bearing `data` fields.
+  function faviconFor(host: string | null | undefined): string {
+    if (!host) return '';
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`;
+  }
 
   interface Props {
     items: any[];
@@ -33,9 +40,9 @@
         style="animation-delay: {i * 30}ms"
       >
         <div class="item-icon">
-          {#if item.type === 'login' && item.data?.url}
+          {#if item.type === 'login' && item._faviconHost}
             <img
-              src={getFaviconUrl(item.data.url)}
+              src={faviconFor(item._faviconHost)}
               alt=""
               class="favicon"
               onerror={(e) => { (e.target as HTMLImageElement).style.display = 'none'; (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden'); }}
@@ -49,7 +56,7 @@
         </div>
         <div class="item-info">
           <span class="item-title">{item.title}</span>
-          <span class="item-subtitle">{getItemSubtitle(item)}</span>
+          <span class="item-subtitle">{item._subtitle ?? ''}</span>
         </div>
         <button
           class="favorite-btn"

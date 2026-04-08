@@ -56,11 +56,11 @@ if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', clearKeys);
   window.addEventListener('beforeunload', clearKeys);
 
-  // Reset idle timer on user interaction.
-  const events: (keyof WindowEventMap)[] = [
-    'mousemove', 'keydown', 'pointerdown', 'touchstart', 'visibilitychange',
-  ];
-  for (const ev of events) {
+  // Reset idle timer on user interaction. `visibilitychange` is on
+  // `document`, the rest are on `window`.
+  const windowEvents = ['mousemove', 'keydown', 'pointerdown', 'touchstart'] as const;
+  for (const ev of windowEvents) {
     window.addEventListener(ev, resetIdleTimer, { passive: true });
   }
+  document.addEventListener('visibilitychange', resetIdleTimer, { passive: true });
 }

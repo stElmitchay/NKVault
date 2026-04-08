@@ -206,8 +206,8 @@ export async function deriveKeyFromWallet(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: saltBytes,
-      info,
+      salt: saltBytes as BufferSource,
+      info: info as BufferSource,
     },
     ikm,
     { name: 'AES-GCM', length: 256 },
