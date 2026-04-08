@@ -202,56 +202,27 @@ async function toggleFavorite(itemId: string, currentValue: boolean): Promise<vo
 }
 
 /**
- * Decrypt all items — decrypts both title and data for display.
- * Tries all available keys (personal vault key + shared vault key) to
- * handle cross-vault items gracefully.
+ * Decrypt-on-demand model
+ * ----------------------
+ * To bound the lifetime of plaintext in memory, we never hold the full
+ * decrypted item set in a reactive store. Instead:
+ *
+ *   - `decryptItemsForList(rawItems)` decrypts each item's title and a
+ *     small set of *non-secret* display fields needed by the list view
+ *     (login username/url, card last-4, note preview, identity name).
+ *     All true secrets — passwords, notes, CVVs, full card numbers —
+ *     are stripped before the result reaches Svelte state.
+ *
+ *   - `decryptItemFull(itemId)` decrypts the title and full data of a
+ *     single item, looked up by id from the raw `items` store. The
+ *     caller stores the result in a single short-lived variable and
+ *     clears it as soon as the user navigates away.
+ *
+ * See docs/THREAT_MODEL.md §5.7 / §6.
  */
-async function decryptItems(rawItems: any[]): Promise<any[]> {
-  // Collect all available keys
-  const keys: CryptoKey[] = [];
-  const vk = getVaultKey();
-  const svk = getSharedVaultKey();
-  if (vk) keys.push(vk);
-  if (svk && svk !== vk) keys.push(svk);
-  if (keys.length === 0) return rawItems;
 
-  return Promise.all(
-    rawItems.map(async (item: any) => {
-      let decTitle = item.title;
-      let decData = item.data;
-
-      // Try decrypting title with each key
-      if (typeof item.title === 'string') {
-        try {
-          const parsed = JSON.parse(item.title);
-          if (isEncrypted(parsed)) {
-            decTitle = await tryDecryptWithKeys(keys, parsed);
-          }
-        } catch {
-          // Not JSON or not encrypted — use as-is
-        }
-      }
-
-      // Try decrypting data with each key
-      if (isEncrypted(item.data)) {
-        for (const key of keys) {
-          try {
-            const plaintext = await decrypt(key, item.data);
-            decData = JSON.parse(plaintext);
-            break; // Success
-          } catch {
-            // Try next key
-          }
-        }
-      }
-
-      return { ...item, title: decTitle, data: decData, _rawTitle: item.title, _rawData: item.data };
-    })
-  );
-}
-
-/** Try decrypting an EncryptedBlob with multiple keys, return first success. */
-async function tryDecryptWithKeys(keys: CryptoKey[], blob: any): Promise<string> {
+/** Try decrypting an EncryptedBlob with each candidate key in turn. */
+async function tryDecryptWithKeys(keys: CryptoKey[], blob: any): Promise<string | null> {
   for (const key of keys) {
     try {
       return await decrypt(key, blob);
@@ -259,7 +230,202 @@ async function tryDecryptWithKeys(keys: CryptoKey[], blob: any): Promise<string>
       // Try next key
     }
   }
-  return '🔒 Encrypted';
+  return null;
+}
+
+function activeKeys(): CryptoKey[] {
+  const out: CryptoKey[] = [];
+  const vk = getVaultKey();
+  const svk = getSharedVaultKey();
+  if (vk) out.push(vk);
+  if (svk && svk !== vk) out.push(svk);
+  return out;
+}
+
+/** Decrypt the title field of an item, returning a placeholder on failure. */
+async function decryptTitle(item: any, keys: CryptoKey[]): Promise<string> {
+  if (typeof item.title !== 'string') return String(item.title ?? '');
+  try {
+    const parsed = JSON.parse(item.title);
+    if (!isEncrypted(parsed)) return item.title;
+    const dec = await tryDecryptWithKeys(keys, parsed);
+    return dec ?? '🔒 Encrypted';
+  } catch {
+    // Title isn't a JSON-encoded blob → assume it's already plaintext
+    // (legacy data path).
+    return item.title;
+  }
+}
+
+/** Decrypt the full data field of an item, or null on failure. */
+async function decryptDataField(item: any, keys: CryptoKey[]): Promise<any> {
+  if (!isEncrypted(item.data)) return item.data;
+  for (const key of keys) {
+    try {
+      const plaintext = await decrypt(key, item.data);
+      return JSON.parse(plaintext);
+    } catch {
+      // try next key
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the *list-safe* projection of a single item: title plus only
+ * the non-secret display fields the list view actually renders.
+ * Pre-renders the subtitle and favicon so the consuming component does
+ * not need access to raw secret fields like card number or note body.
+ */
+function projectForList(rawItem: any, decTitle: string, decData: any): any {
+  const display: Record<string, unknown> = {};
+  let subtitle = '';
+  let faviconHost: string | null = null;
+
+  if (decData && typeof decData === 'object') {
+    switch (rawItem.type) {
+      case 'login': {
+        const username = typeof decData.username === 'string' ? decData.username : '';
+        const url = typeof decData.url === 'string' ? decData.url : '';
+        display.username = username;
+        display.url = url;
+        subtitle = username || url || 'No username';
+        if (url) {
+          try {
+            faviconHost = new URL(url.startsWith('http') ? url : `https://${url}`).hostname;
+          } catch {
+            faviconHost = null;
+          }
+        }
+        break;
+      }
+      case 'card': {
+        const num = typeof decData.number === 'string' ? decData.number : '';
+        // Pre-render the masked last-4. The full number never leaves
+        // this scope — it is NOT placed on `display`.
+        subtitle = num ? `•••• ${num.slice(-4)}` : 'No card number';
+        break;
+      }
+      case 'note': {
+        const content = typeof decData.content === 'string' ? decData.content : '';
+        // Cap the preview at 50 chars; the rest stays out of memory
+        // for the list view.
+        subtitle = content ? content.substring(0, 50) : 'Empty note';
+        break;
+      }
+      case 'identity': {
+        const fn = typeof decData.firstName === 'string' ? decData.firstName : '';
+        const ln = typeof decData.lastName === 'string' ? decData.lastName : '';
+        display.firstName = fn;
+        display.lastName = ln;
+        subtitle = [fn, ln].filter(Boolean).join(' ') || 'No name';
+        break;
+      }
+    }
+  }
+
+  return {
+    id: rawItem.id,
+    title: decTitle,
+    type: rawItem.type,
+    favorite: !!rawItem.favorite,
+    createdAt: rawItem.createdAt,
+    updatedAt: rawItem.updatedAt,
+    vaultId: rawItem.vaultId,
+    data: display,         // non-secret display fields only
+    _subtitle: subtitle,   // pre-rendered for ItemList
+    _faviconHost: faviconHost, // pre-rendered favicon source
+  };
+}
+
+/**
+ * Decrypt the *list view* of the given raw items. Strips all secret
+ * fields. Returns objects safe to put in long-lived reactive state.
+ */
+async function decryptItemsForList(rawItems: any[]): Promise<any[]> {
+  const keys = activeKeys();
+  if (keys.length === 0) {
+    // Vault is locked — render placeholders rather than raw ciphertext.
+    return rawItems.map((item) => ({
+      id: item.id,
+      title: '🔒 Encrypted',
+      type: item.type,
+      favorite: !!item.favorite,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      vaultId: item.vaultId,
+      data: {},
+      _subtitle: '',
+      _faviconHost: null,
+    }));
+  }
+
+  return Promise.all(
+    rawItems.map(async (item) => {
+      const [decTitle, decData] = await Promise.all([
+        decryptTitle(item, keys),
+        decryptDataField(item, keys),
+      ]);
+      return projectForList(item, decTitle, decData);
+    })
+  );
+}
+
+/**
+ * Decrypt one item's full plaintext (title + complete data). Looked up
+ * by id from the raw `items` store so that callers do not need to keep
+ * an encrypted blob around. Returns null if the item no longer exists
+ * or cannot be decrypted with any active key.
+ *
+ * The returned object is the *only* place a fully-decrypted item should
+ * live in memory — store it in a single short-lived variable and clear
+ * it as soon as the user navigates away.
+ */
+/**
+ * Decrypt EVERY item's full plaintext. Intended SOLELY for the user-
+ * initiated export flow in SettingsPanel — that's the one place where
+ * the user has explicitly asked for an in-memory dump of the entire
+ * vault. Do not call this from any other surface.
+ */
+async function decryptAllForExport(): Promise<Array<{
+  title: string;
+  type: string;
+  data: any;
+  favorite: boolean;
+  createdAt: number;
+  updatedAt: number;
+}>> {
+  const keys = activeKeys();
+  if (keys.length === 0) return [];
+  return Promise.all(
+    items.map(async (item: any) => {
+      const [decTitle, decData] = await Promise.all([
+        decryptTitle(item, keys),
+        decryptDataField(item, keys),
+      ]);
+      return {
+        title: decTitle,
+        type: item.type,
+        data: decData,
+        favorite: !!item.favorite,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+      };
+    })
+  );
+}
+
+async function decryptItemFull(itemId: string): Promise<{ title: string; data: any } | null> {
+  const raw = items.find((i: any) => i.id === itemId);
+  if (!raw) return null;
+  const keys = activeKeys();
+  if (keys.length === 0) return null;
+  const [decTitle, decData] = await Promise.all([
+    decryptTitle(raw, keys),
+    decryptDataField(raw, keys),
+  ]);
+  if (decData == null) return null;
+  return { title: decTitle, data: decData };
 }
 
 // Get filtered items
@@ -318,7 +484,9 @@ export function getVaultStore() {
     toggleFavorite,
     getFilteredItems,
     decryptItemData,
-    decryptItems,
+    decryptItemsForList,
+    decryptItemFull,
+    decryptAllForExport,
     destroy,
   };
 }

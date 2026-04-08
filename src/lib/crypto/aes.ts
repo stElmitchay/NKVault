@@ -35,9 +35,9 @@ export async function decrypt(key: CryptoKey, blob: EncryptedBlob): Promise<stri
   const ciphertextBuffer = base64ToBuffer(blob.ciphertext);
 
   const plaintext = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
+    { name: 'AES-GCM', iv: iv as BufferSource },
     key,
-    ciphertextBuffer
+    ciphertextBuffer as BufferSource
   );
 
   return new TextDecoder().decode(plaintext);

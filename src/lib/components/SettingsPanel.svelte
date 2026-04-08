@@ -60,20 +60,14 @@
   async function handleExport() {
     isExporting = true;
     try {
-      const rawItems = vault.items;
-      const decrypted = await vault.decryptItems(rawItems);
+      // User-initiated full export — this is the one place we
+      // intentionally pull every item's plaintext into memory.
+      const decrypted = await vault.decryptAllForExport();
       const exportData = {
         exportedAt: new Date().toISOString(),
         version: '1.0',
         itemCount: decrypted.length,
-        items: decrypted.map(item => ({
-          title: item.title,
-          type: item.type,
-          data: item.data,
-          favorite: item.favorite,
-          createdAt: item.createdAt,
-          updatedAt: item.updatedAt,
-        })),
+        items: decrypted,
       };
 
       const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
