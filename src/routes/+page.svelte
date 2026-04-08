@@ -57,7 +57,7 @@
     vault.init();
     if (auth.user) {
       await vault.ensurePersonalVault(auth.user.id);
-      await vault.ensureSharedVault();
+      await vault.ensureSharedVault(auth.user.id);
     }
   });
 
@@ -137,7 +137,7 @@
     } else {
       const vaultId = vault.activeVaultType === 'personal'
         ? await vault.ensurePersonalVault(auth.user.id)
-        : await vault.ensureSharedVault();
+        : await vault.ensureSharedVault(auth.user.id);
       await vault.createItem(title, type, data, vaultId, auth.user.id);
       showToast('Item created');
     }

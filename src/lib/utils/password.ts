@@ -57,9 +57,16 @@ export function generatePassword(options: PasswordOptions): string {
 }
 
 function cryptoRandom(max: number): number {
+  if (max <= 0) return 0;
+  // Rejection sampling: discard values that would introduce modulo bias.
   const array = new Uint32Array(1);
-  crypto.getRandomValues(array);
-  return array[0] % max;
+  const limit = Math.floor(0xFFFFFFFF / max) * max;
+  let r: number;
+  do {
+    crypto.getRandomValues(array);
+    r = array[0];
+  } while (r >= limit);
+  return r % max;
 }
 
 export function getPasswordStrength(password: string): {

@@ -1,39 +1,33 @@
 // NKVault — Secure Clipboard with Auto-Clear
 
-const CLEAR_TIMEOUT_MS = 30_000; // 30 seconds
+const DEFAULT_CLEAR_MS = 30_000;
 let clearTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * Copy text to clipboard and auto-clear after 30 seconds.
+ * Copy text to clipboard and auto-clear after `clearMs` (default 30s).
  * Returns true if copy succeeded.
+ *
+ * The clear path unconditionally overwrites with an empty string rather
+ * than reading first — `readText` requires document focus and silently
+ * fails in popup/background contexts, which previously left passwords
+ * sitting on the clipboard indefinitely.
  */
-export async function secureCopy(text: string): Promise<boolean> {
+export async function secureCopy(text: string, clearMs: number = DEFAULT_CLEAR_MS): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
 
-    // Clear any existing timeout
     if (clearTimeoutId !== null) {
       clearTimeout(clearTimeoutId);
     }
 
-    // Schedule auto-clear
     clearTimeoutId = setTimeout(async () => {
       try {
-        // Only clear if clipboard still has our text
-        const current = await navigator.clipboard.readText();
-        if (current === text) {
-          await navigator.clipboard.writeText('');
-        }
+        await navigator.clipboard.writeText('');
       } catch {
-        // readText may fail due to permissions — still try to clear
-        try {
-          await navigator.clipboard.writeText('');
-        } catch {
-          // Silently fail
-        }
+        // Silently fail — best-effort
       }
       clearTimeoutId = null;
-    }, CLEAR_TIMEOUT_MS);
+    }, clearMs);
 
     return true;
   } catch {

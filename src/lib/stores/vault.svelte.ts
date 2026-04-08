@@ -68,16 +68,19 @@ async function ensurePersonalVault(userId: string): Promise<string> {
 }
 
 // Ensure a shared vault exists
-async function ensureSharedVault(): Promise<string> {
+async function ensureSharedVault(userId: string): Promise<string> {
   const existing = vaults.find((v: any) => v.type === 'shared');
   if (existing) return existing.id;
 
+  // The first user to create the shared vault becomes its owner. Update
+  // permissions are bound to the owner. Shared distribution of items is
+  // pending the per-user-wrap redesign — see security/hardening-pass-1.
   const vaultId = id();
   await db.transact(
     db.tx.vaults[vaultId].update({
       name: 'Shared',
       type: 'shared',
-      ownerId: 'system',
+      ownerId: userId,
     })
   );
   return vaultId;
@@ -125,16 +128,17 @@ async function createItem(
   const now = Date.now();
 
   const key = getEncryptionKey();
-  let storedData: any = data;
-  let storedTitle: string = title;
-
-  if (key) {
-    try {
-      storedData = await encrypt(key, JSON.stringify(data));
-      storedTitle = JSON.stringify(await encrypt(key, title));
-    } catch (err) {
-      console.warn('Encryption failed, storing plaintext:', err);
-    }
+  if (!key) {
+    throw new Error('Vault is locked — refusing to save plaintext.');
+  }
+  let storedData: any;
+  let storedTitle: string;
+  try {
+    storedData = await encrypt(key, JSON.stringify(data));
+    storedTitle = JSON.stringify(await encrypt(key, title));
+  } catch (err) {
+    // Fail closed — never persist plaintext.
+    throw new Error(`Encryption failed: ${(err as Error).message}`);
   }
 
   await db.transact([
@@ -160,23 +164,23 @@ async function updateItem(
   const finalUpdates: any = { ...updates, updatedAt: Date.now() };
   const key = getEncryptionKey();
 
-  // Encrypt title if provided
+  if ((updates.title !== undefined || updates.data !== undefined) && !key) {
+    throw new Error('Vault is locked — refusing to save plaintext.');
+  }
+
   if (updates.title && key) {
     try {
       finalUpdates.title = JSON.stringify(await encrypt(key, updates.title));
     } catch (err) {
-      console.warn('Title encryption failed on update:', err);
+      throw new Error(`Title encryption failed: ${(err as Error).message}`);
     }
   }
 
-  // Encrypt data if provided and not already encrypted
-  if (updates.data && !isEncrypted(updates.data)) {
-    if (key) {
-      try {
-        finalUpdates.data = await encrypt(key, JSON.stringify(updates.data));
-      } catch (err) {
-        console.warn('Encryption failed on update:', err);
-      }
+  if (updates.data !== undefined && !isEncrypted(updates.data)) {
+    try {
+      finalUpdates.data = await encrypt(key!, JSON.stringify(updates.data));
+    } catch (err) {
+      throw new Error(`Data encryption failed: ${(err as Error).message}`);
     }
   }
 

@@ -3,8 +3,6 @@
   import { getAuth } from '$lib/stores/auth.svelte';
   import { getCryptoStore } from '$lib/stores/crypto.svelte';
   import { getSettings } from '$lib/stores/settings.svelte';
-  import { getVaultKey } from '$lib/crypto/session';
-  import { exportKey } from '$lib/crypto/keys';
   import LoginForm from '$lib/components/LoginForm.svelte';
   import WalletSetup from '$lib/components/WalletSetup.svelte';
   import WalletUnlock from '$lib/components/WalletUnlock.svelte';
@@ -22,46 +20,16 @@
     }
   });
 
-  // ---- Browser Extension Auth Sync Bridge ----
-  // Broadcasts auth state and vault key to the NKVault extension
-  // via window.postMessage. The content script listens for these
-  // messages and forwards them to the background service worker.
+  // ---- Browser Extension Lock-State Bridge ----
+  // The vault key is NEVER broadcast to the extension via postMessage —
+  // any iframe on the page would receive it. Instead, the extension
+  // derives its own copy via the wallet signature path. We only signal
+  // lock-state transitions here, scoped to the current origin.
   $effect(() => {
-    const user = auth.user;
+    if (typeof window === 'undefined') return;
     const unlocked = cryptoStore.isVaultUnlocked;
-
-    if (user && unlocked) {
-      // Export vault key and broadcast to the extension
-      const key = getVaultKey();
-      if (key) {
-        exportKey(key).then((rawBytes) => {
-          // Convert to base64
-          let binary = '';
-          for (let i = 0; i < rawBytes.length; i++) {
-            binary += String.fromCharCode(rawBytes[i]);
-          }
-          const keyBase64 = btoa(binary);
-
-          // Send auth info
-          window.postMessage({
-            type: 'NKVAULT_AUTH_SYNC',
-            token: 'session-active',
-            refreshToken: '',
-            user: { id: user.id, email: user.email },
-          }, '*');
-
-          // Send vault key
-          window.postMessage({
-            type: 'NKVAULT_VAULT_KEY_SYNC',
-            keyBase64,
-          }, '*');
-        });
-      }
-    } else if (user && !unlocked) {
-      // Vault was locked — notify extension
-      window.postMessage({
-        type: 'NKVAULT_VAULT_LOCKED',
-      }, '*');
+    if (auth.user && !unlocked) {
+      window.postMessage({ type: 'NKVAULT_VAULT_LOCKED' }, window.location.origin);
     }
   });
 </script>
