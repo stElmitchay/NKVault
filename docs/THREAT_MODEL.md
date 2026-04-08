@@ -5,7 +5,51 @@ what it does not, and where each defense lives in the codebase. If a
 claim in marketing copy or in the README is not backed by something in
 this document, the claim is wrong.
 
-Last updated: security/hardening-pass-2 (companion to PR #2).
+Last updated: docs/threat-model-correction (companion to PR #3).
+
+---
+
+## 0. Design principle: wallet-as-personal-key, org-as-recovery
+
+NKVault makes one product decision that everything else flows from:
+
+> **Your wallet IS your personal vault key. There is no recovery for
+> personal items. Your organization (the shared vault) is the recovery
+> story for everything that needs to survive a lost wallet.**
+
+Concretely, for a `@christex.foundation` user:
+
+1. **Personal items** (passwords, notes, cards, identities saved to
+   "Personal Vault") are encrypted under a key derived from a Solana
+   wallet signature. If the user loses that wallet, those items are
+   gone forever. There is no recovery code, no master password, no
+   secret-question fallback, no admin override. **By design.** The
+   moment a recovery channel exists, the server-side adversary
+   (§2 #4) gains a path to plaintext.
+
+2. **Shared items** (passwords stored in "Shared Vault") belong to
+   the organization, not the individual. If a user loses their wallet
+   they re-authenticate via InstantDB magic-code (their company email
+   still works), set up a new wallet, and another existing member of
+   the shared vault re-grants them access by re-wrapping the shared
+   key under the new wallet's membership public key. They lose their
+   personal items but the organization's institutional knowledge
+   survives.
+
+This is a deliberate trade — NKVault is *less recoverable* than a
+typical password manager and *more confidential*. Anyone who finds
+this trade unacceptable should not use NKVault.
+
+> **Current build gap (tracked, not resolved here):** Pass-1 of the
+> security hardening removed the original shared-vault escrow flow
+> because it derived its wrap key from a constant in the JS bundle,
+> which broke the zero-knowledge claim for shared data. The
+> replacement — per-user wrap with each member's wallet-derived
+> membership key — is the subject of PR #4. Until #4 lands, the
+> shared vault is non-functional after a wallet change, which means
+> the recovery story above is **promised but not yet delivered**.
+> The README and the WalletSetup screen must not claim shared-vault
+> recovery works until #4 ships.
 
 ---
 
@@ -17,7 +61,8 @@ Last updated: security/hardening-pass-2 (companion to PR #2).
 | **Wrap key** | Derived from a Solana wallet signature via HKDF-SHA256 + per-profile salt. Used solely to wrap/unwrap the vault key. | Never persisted. Re-derived on every unlock. |
 | **Item ciphertext** | AES-256-GCM blob containing a JSON-serialized item (`title` and `data` are encrypted separately). | InstantDB `items` table. |
 | **Item plaintext** | Decrypted title + data of an item (passwords, notes, card numbers, etc.). | In memory only. List view holds non-secret display fields; full plaintext exists only for the currently selected item. See §6. |
-| **Profile metadata** | `email`, `walletAddress`, `kdfSalt`, `hasCompletedSetup`. Not secret on its own, but `walletAddress` + `kdfSalt` + `encryptedVaultKey` together enable an offline attack against a stolen wallet. | InstantDB `profiles` table. Read/write restricted to `auth.id == clerkId` — see `instant.perms.ts`. |
+| **Profile metadata** | `email`, `walletAddress`, `kdfSalt`, `hasCompletedSetup`, and (after PR #4) `membershipPubKey` — the X25519 public key derived from the user's wallet signature, used by other members to wrap the shared key for them. Not secret on its own, but `walletAddress` + `kdfSalt` + `encryptedVaultKey` together enable an offline attack against a stolen wallet. | InstantDB `profiles` table. Read/write restricted to `auth.id == clerkId` — see `instant.perms.ts`. |
+| **Shared vault membership wrap** | The shared vault's symmetric AES-256 key, encrypted *to a single member's wallet-derived X25519 public key* using XChaCha20-Poly1305. One row per (vault, member). Added in PR #4. | InstantDB `sharedVaultMembers` table. Read restricted to `data.userId == auth.id`. |
 
 ## 2. Adversaries
 
@@ -52,10 +97,13 @@ in one of these scenarios should treat their vault as compromised.
   cost of a phishing-style replay (the attacker must also obtain the
   victim's `kdfSalt` from the database, which now requires authenticating
   as the victim — see §5.1) but they cannot stop a full wallet compromise.
-- **Loss of master key with no recovery flow.** Recovery codes and
-  Shamir-style social recovery are not yet implemented. If the user
-  loses their wallet they lose their vault. This is documented as a
-  follow-up.
+- **Loss of the personal vault.** If the user loses their wallet and
+  cannot sign with it again, every item in their personal vault is
+  permanently inaccessible. This is **by design** (§0). NKVault has
+  no recovery codes, no Shamir splits, no admin override. The user
+  retains access to the *shared* vault via the re-auth flow (§5.10),
+  but their personal items are gone. This is the explicit trade
+  NKVault makes to keep the personal vault genuinely zero-knowledge.
 - **Cryptanalysis of AES-256-GCM, HKDF-SHA256, or Ed25519.** If any
   of those primitives is broken, NKVault is broken.
 - **Side channels** (timing, power, EM, microarchitectural) on
@@ -200,6 +248,62 @@ another user's profile, vault, items, or `kdfSalt`.
   Required-class inclusion is deterministic to ensure user options
   are honored.
 
+### 5.10 Re-auth recovery for the shared vault (planned, PR #4)
+
+This is the *only* recovery channel NKVault supports, and it
+deliberately recovers the *organization's* shared knowledge — never
+the individual's personal items.
+
+The flow, once PR #4 ships:
+
+1. User loses their wallet.
+2. User signs in to NKVault via InstantDB magic-code using their
+   `@christex.foundation` email. This proves possession of the email
+   account but does **not** unlock anything yet.
+3. The app detects an existing profile with a wallet address that
+   no longer matches any wallet the user can sign with, and offers
+   a "Set up new wallet" flow.
+4. User connects a new Solana wallet and signs the deterministic
+   message. The app generates a new `kdfSalt`, derives a new HKDF
+   wrap key, generates a *new* random vault key, and writes a fresh
+   `encryptedVaultKey` and a fresh `membershipPubKey` to the user's
+   profile. The personal vault is now empty (the old `encryptedVaultKey`
+   was wrapped with a key the user can no longer derive — it stays
+   in the database as inert ciphertext). **The user's old personal
+   items are gone, by design.**
+5. The user's old `sharedVaultMembers` rows reference an X25519
+   private key the user can no longer derive. They are stale.
+6. Any existing member of the shared vault can re-grant access by
+   fetching the user's new `membershipPubKey` from their profile
+   and writing a fresh `sharedVaultMembers` row containing the
+   shared key wrapped to the new public key.
+7. On next unlock, the user derives the new membership X25519 keypair
+   from their new wallet signature, finds the new row, and decrypts
+   the shared key. They now see every item in the shared vault, just
+   as before — including any items they themselves had stored there
+   under their *old* wallet, because shared items were always
+   encrypted under the (unchanged) shared key, not the user's
+   personal vault key.
+
+What this flow protects:
+- Confidentiality of personal items, even against the user themselves
+  after wallet loss.
+- Integrity of organizational knowledge across personnel transitions
+  (lost laptop, new device, etc.).
+
+What this flow does **not** protect:
+- A user who loses their wallet *and* whose `@christex.foundation`
+  email account is also compromised — that attacker can re-auth and
+  receive a re-grant from any well-meaning existing member. Defense:
+  the existing member should verify the request out-of-band (Slack,
+  in person) before granting. This is documented in the WalletSetup
+  copy in PR #4.
+- A user who is the *only* member of a shared vault and loses their
+  wallet. There is no one to re-grant them. Their shared vault is
+  inaccessible. Defense: shared vaults should always have at least
+  two members. The grant UI in PR #4 will warn on single-member
+  vaults.
+
 ## 6. Plaintext-in-memory model
 
 For each item in the user's vault, plaintext exists in memory only in
@@ -215,24 +319,34 @@ the following cases:
 
 ## 7. Known gaps and follow-ups
 
-These are not bugs — they are conscious limitations being tracked:
+These are not bugs — they are conscious limitations being tracked.
+(Personal-vault recovery is **not** in this list. It is intentionally
+absent — see §0.)
 
-1. **Recovery flow.** No way to recover a vault without the wallet.
-2. **Shared vault per-user wrap.** Sharing items via a shared vault
-   currently requires each item to be encrypted under the personal
-   key, defeating the point. The escrow flow that previously addressed
-   this was insecure (constant-derived wrap key) and has been removed.
-3. **Memory zeroization.** JavaScript strings can't be wiped. The
+1. **Shared vault per-user wrap (PR #4, in progress).** The recovery
+   story in §0 depends on the shared vault working: a user with a
+   new wallet must be able to be re-granted access by an existing
+   member. The escrow flow that previously did this was insecure
+   (the wrap key was derived from a constant in the JS bundle) and
+   has been removed. The replacement is a per-member wrap where
+   every member publishes a wallet-derived X25519 membership public
+   key in their profile, and an existing member re-wraps the shared
+   key to that public key when granting access. Until PR #4 ships,
+   the shared vault is non-functional and the recovery story is a
+   promise, not a delivered feature.
+2. **Memory zeroization.** JavaScript strings can't be wiped. The
    only mitigation is reducing the *time* plaintext spends in memory,
    which §5.7 does.
-4. **Server-side email allow-list.** The `@christex.foundation`
+3. **Server-side email allow-list.** The `@christex.foundation`
    allow-list is enforced only client-side; should be configured in
    the InstantDB dashboard as well.
-5. **Self-hosted favicon proxy.** Favicons are fetched from
+4. **Self-hosted favicon proxy.** Favicons are fetched from
    `google.com/s2/favicons`, which leaks saved hostnames.
-6. **Adapter pin.** `svelte.config.js` uses `adapter-auto`. Should
+5. **Adapter pin.** `svelte.config.js` uses `adapter-auto`. Should
    be pinned to `adapter-static` to prevent accidental Node functions.
-7. **Third-party security audit.** Has not been performed.
+6. **Third-party security audit.** Has not been performed. Should
+   happen after PR #4 ships, since the shared-vault crypto is the
+   most novel piece of the design.
 
 ## 8. Reporting a vulnerability
 

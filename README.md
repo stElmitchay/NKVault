@@ -9,6 +9,7 @@
 <p align="center">
   <a href="#features">Features</a> •
   <a href="#how-it-works">How It Works</a> •
+  <a href="#recovery-model">Recovery model</a> •
   <a href="#security">Security</a> •
   <a href="#getting-started">Getting Started</a> •
   <a href="#browser-extension">Browser Extension</a> •
@@ -27,7 +28,9 @@
 
 NKVault is a **zero-knowledge password manager** where your data is encrypted client-side before it ever touches a server. No one — not even the server — can read your passwords.
 
-Your vault key is derived from your **Solana wallet signature**, meaning only your physical wallet can unlock your data. No master password to remember, no server-side secrets to leak.
+Your vault key is derived from your **Solana wallet signature**, meaning only your physical wallet can unlock your data. No master password to remember, no server-side secrets to leak, **no recovery codes**.
+
+> **Read this before you use NKVault.** Your wallet *is* your personal vault. If you lose it, your personal items are gone forever — there is no recovery. This is the trade NKVault makes to keep your personal vault genuinely zero-knowledge. Your organization's **shared vault** is the recovery story for everything that needs to survive a lost wallet: re-authenticate with your company email, set up a new wallet, and another member re-grants you access. See [Recovery model](#recovery-model) below.
 
 ## Features
 
@@ -38,8 +41,9 @@ Your vault key is derived from your **Solana wallet signature**, meaning only yo
 
 ### 🪙 Wallet-Based Authentication
 - Sign in with your Solana wallet (Phantom, Solflare, etc.)
-- Deterministic key derivation from wallet signature
+- HKDF-SHA256 key derivation from a wallet signature, with a fresh per-profile random salt and a userId-bound domain-separation context
 - No master password required — your wallet IS your key
+- **No recovery for personal items.** This is intentional. See [Recovery model](#recovery-model).
 
 ### 📦 Store Everything
 - **Logins** — username, password, URL with favicon
@@ -48,15 +52,16 @@ Your vault key is derived from your **Solana wallet signature**, meaning only yo
 - **Identities** — name, email, phone, address
 
 ### 🌐 Browser Extension (Chrome & Opera)
-- **Autofill** — detects login forms and fills credentials
-- **Auto-fill signup forms** — fills identity data + generates strong passwords
+- **Autofill** — detects login forms and fills credentials on user click
 - **Autosave** — prompts to save new logins or update changed passwords
 - **Password generator** — create strong passwords instantly
 - **URL matching** — suggests relevant credentials per site
 
+> **Note on autofill safety.** Earlier versions of the extension auto-filled signup forms with identity data + a generated password without an explicit user gesture. That was removed in security/hardening-pass-1: a heuristic running on `<all_urls>` could be triggered by any page that looked like a signup form, and the resulting plaintext password was readable from the page DOM. **Filling now always requires a user click on the badge.**
+
 ### 🔄 Real-Time Sync
 - Powered by [InstantDB](https://instantdb.com) — changes sync across devices instantly
-- Shared vaults for team credential sharing
+- Personal vault per user, plus an organization-wide shared vault
 - Works offline, syncs when reconnected
 
 ### 🎨 Premium UI
@@ -68,39 +73,77 @@ Your vault key is derived from your **Solana wallet signature**, meaning only yo
 ## How It Works
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Your Wallet │────▶│  Derive Key  │────▶│  Vault Key   │
-│  (Phantom)   │sign │  (SHA-256)   │     │  (AES-256)   │
-└──────────────┘     └──────────────┘     └──────┬───────┘
-                                                 │
-                                                 ▼
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Your Data   │────▶│   Encrypt    │────▶│  InstantDB   │
-│  (plaintext) │     │  (AES-GCM)   │     │  (encrypted) │
-└──────────────┘     └──────────────┘     └──────────────┘
+┌──────────────┐    ┌─────────────────────┐    ┌──────────────┐
+│  Your Wallet │───▶│  HKDF-SHA256        │───▶│  Wrap Key    │
+│  (Phantom)   │sig │  salt = profile     │    │  (AES-256)   │
+│              │    │  info = userId      │    │              │
+└──────────────┘    └─────────────────────┘    └──────┬───────┘
+                                                      │ unwrap
+                                                      ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Your Data   │───▶│   Encrypt    │───▶│  InstantDB   │
+│  (plaintext) │    │  (AES-GCM)   │    │  (encrypted) │
+└──────────────┘    └──────────────┘    └──────────────┘
+        ▲ vault key
+        │
+┌──────────────┐
+│ Random AES   │
+│   vault key  │
+└──────────────┘
 ```
 
-1. **Connect** your Solana wallet
-2. **Sign** a deterministic message → wallet-derived key (SHA-256)
-3. **Generate** a random vault key (AES-256-GCM)
-4. **Wrap** the vault key with the wallet-derived key
-5. **Encrypt** all data with the vault key before syncing
+1. **Connect** your Solana wallet.
+2. **Sign** a deterministic message — Ed25519 signatures are deterministic, so the same wallet always produces the same signature for the same message.
+3. **Derive** a wrap key with HKDF-SHA256, using a fresh random salt stored in your profile and a domain-separation `info` string of `"NKVault v2 wrapKey:" + userId`.
+4. **Generate** a random vault key (AES-256-GCM) on first setup, and wrap it under the HKDF-derived wrap key.
+5. **Encrypt** every item's title and data under the vault key with a fresh 12-byte IV per operation before syncing.
 
-The server only ever sees encrypted blobs. Your plaintext data never leaves your device.
+The server only ever sees encrypted blobs and a salt. Your plaintext data never leaves your device. Your wrap key is re-derived in memory on every unlock and cleared on lock, page hide, or after 10 minutes of idle.
+
+## Recovery model
+
+NKVault has exactly one recovery channel, and it deliberately recovers the **organization's** shared knowledge — never an individual's personal items.
+
+### What happens if you lose your wallet
+
+| Vault | What happens |
+|-------|--------------|
+| **Personal vault** | **Gone. Permanently.** Your personal items were encrypted under a key derived from your wallet signature. With no wallet, the signature can't be reproduced and the wrap key can't be re-derived. NKVault has no recovery codes, no Shamir splits, no admin override. This is by design — the moment a recovery channel exists, the database operator gains a path to your plaintext. |
+| **Shared vault** | **Recoverable.** Your `@christex.foundation` email still authenticates you via InstantDB magic-code. You set up a new wallet, and another existing member of the shared vault re-grants you access by re-wrapping the shared key under your new wallet's membership public key. You see every item in the shared vault again — including items you yourself stored there under your old wallet, because shared items were always encrypted under the (unchanged) shared key. |
+
+### Why we made this trade
+
+A typical password manager has a master password and a server-side hash. If you forget the password, you lose your vault. The server can offer "reset via email" because it holds enough state to do so — which means the server holds enough state to read your vault if it wants to (or is compelled to).
+
+NKVault holds no such state. The only thing on the server is ciphertext, a wallet address, and a salt. The cost is that there is no fallback if you lose the only thing that can produce the signature. We think that cost is worth paying for a tool used by people who store sensitive credentials.
+
+### Practical advice
+
+- **Treat your wallet seed like the real master password it is.** Back it up the way wallet users normally back up seeds.
+- **Don't be the only member of your shared vault.** A single-member shared vault has no one to re-grant access. The grant UI will warn you about this.
+- **For credentials your team needs even if you vanish, save them to the shared vault.** Personal vault is for things only you need.
+- **When granting access to a returning member, verify the request out-of-band** (Slack, in person). Their email being authenticated proves only that they hold the email account, not that they are who you think they are.
+
+> **Status:** The shared-vault re-grant flow was insecure in earlier builds (the wrap key was derived from a constant in the JS bundle) and was removed in security/hardening-pass-1. The replacement — per-member wrap with each member's wallet-derived X25519 membership public key — is the subject of PR #4. Until that ships, the shared vault is non-functional after a wallet change. See `docs/THREAT_MODEL.md` §0 and §5.10 for the full design.
 
 ## Security
 
 | Aspect | Detail |
 |--------|--------|
-| **Encryption** | AES-256-GCM with unique 12-byte IVs |
-| **Key Derivation** | Solana wallet signature → SHA-256 |
-| **Key Storage** | Vault key wrapped (encrypted) with wallet-derived key, stored as ciphertext in DB |
-| **Session Key** | Held in-memory only, cleared on page unload |
-| **Auto-Lock** | Vault locks after 15 minutes of inactivity |
-| **Clipboard** | Copied passwords auto-clear after 30 seconds |
-| **Extension** | Content scripts never see encryption keys; vault key held in service worker memory only |
-| **Zero Knowledge** | Server stores only encrypted data — no plaintext, no master password hash |
-| **No Tracking** | No analytics, no telemetry, no third-party scripts |
+| **Encryption** | AES-256-GCM with a fresh random 12-byte IV per operation |
+| **Key Derivation** | Solana wallet signature → HKDF-SHA256 with a per-profile random salt and a `userId`-bound `info` string. Legacy SHA-256 path retained for one-time auto-migration of pre-pass-1 profiles. |
+| **Key Storage** | Vault key is randomly generated, wrapped with the HKDF-derived wrap key, and stored as ciphertext in InstantDB. The wrap key is never persisted. |
+| **Session Key** | Held in memory only. Cleared on page hide, page unload, manual lock, or 10 minutes of idle. |
+| **Auto-Lock** | Web app: 10-minute idle timer. Browser extension: 15 minutes of no user-gesture messages. |
+| **Clipboard** | Copied passwords auto-clear after a user-configurable interval (default 30s). The clear path blindly overwrites rather than reading first, so it works even when the popup loses focus. |
+| **Extension** | The web app **never** broadcasts the vault key to the extension. The extension authenticates via its own InstantDB session and derives its own vault key from the same wallet signature path. The web app only emits an origin-scoped lock signal. |
+| **Plaintext in memory** | The list view holds only non-secret display fields. Full plaintext exists only for the currently selected item and is cleared on navigation. See `docs/THREAT_MODEL.md` §6. |
+| **Zero Knowledge** | Server stores ciphertext, wallet addresses, and salts. No plaintext, no master password hash, no recovery codes. |
+| **Authorization** | Data-bound InstantDB permissions: profiles are self-only, personal vaults are owner-only, items are scoped via the linked vault. See `instant.perms.ts`. |
+| **Generated passwords** | `crypto.getRandomValues` with rejection sampling on the 32-bit RNG to eliminate modulo bias. |
+| **Tests** | 30 unit tests covering AES, key wrap/unwrap, wallet KDF (v1 + v2), and the password generator. CI gates merges on `npm run check` + `npm test` + production-deps audit. |
+| **No Tracking** | No analytics, no telemetry, no third-party scripts. CSP restricts `connect-src` to `'self' https://*.instantdb.com wss://*.instantdb.com`. |
+| **Threat model** | Published in `docs/THREAT_MODEL.md`. Read it before you trust this with anything important. |
 
 ## Getting Started
 
@@ -161,10 +204,14 @@ npm run build
 
 ### How Auth Sync Works
 
-1. Sign in and unlock your vault in the **NKVault web app**
-2. The web app broadcasts your session to the extension via `window.postMessage`
-3. The extension's service worker stores the vault key in memory
-4. Autofill, autosave, and signup auto-fill all work on any website
+The extension is an **independent NKVault client** that talks to InstantDB on its own. It does not receive any secrets from the web app.
+
+1. Sign in to NKVault in the extension popup (the same magic-code email flow as the web app).
+2. The extension's service worker connects to InstantDB via its own session and derives its own vault key from your wallet signature — same HKDF v2 derivation as the web app.
+3. The web app, when it locks, sends an origin-scoped `NKVAULT_VAULT_LOCKED` message to the extension as a courtesy so the extension can mirror the lock. **No keys, no auth tokens, no session blobs are transmitted between contexts.**
+4. Autofill works on any website on user click.
+
+This is a deliberate change from earlier builds, which used `window.postMessage(..., '*')` to broadcast the vault key to the content script. That allowed any iframe on the page to capture the key. See `docs/THREAT_MODEL.md` §5.4 for the current key-distribution model.
 
 ### Extension Features
 
@@ -172,7 +219,7 @@ npm run build
 |---------|-------------|
 | **Autofill badge** | Lime green lock icon appears in password fields |
 | **Credential dropdown** | Click the badge → see matching logins with favicons |
-| **Signup auto-fill** | Detects registration forms → fills identity + generates password |
+| **Click-to-fill** | Filling always requires an explicit user click. The extension never auto-pastes secrets into a page on its own. |
 | **Autosave** | Detects form submissions → offers to save or update credentials |
 | **Password generator** | Generate strong passwords from the popup |
 | **Auto-lock** | Vault key cleared after 15 minutes of inactivity |
@@ -224,12 +271,18 @@ Contributions are welcome! Please:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+### Reporting a security issue
+
+**Please do not open a public GitHub issue for security vulnerabilities.** Email the maintainers with a description and reproduction steps. We will acknowledge within 72 hours. See `docs/THREAT_MODEL.md` §8.
+
 ### Development Tips
 
 - The web app runs on `http://localhost:5173`
 - The extension builds to `browser-extension/dist/` — reload in Chrome after changes
 - All crypto operations use the Web Crypto API — no external crypto libraries
 - Svelte 5 runes (`$state`, `$derived`, `$effect`) are used throughout
+- Run `npm run check` and `npm test` before opening a PR. CI runs both.
+- **Read `docs/THREAT_MODEL.md` before touching anything in `src/lib/crypto/`, `instant.perms.ts`, `src/lib/stores/vault.svelte.ts`, or `browser-extension/manifest.json`.** Changes to those paths are security-relevant by definition.
 
 ## License
 
